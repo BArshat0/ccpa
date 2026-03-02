@@ -1,0 +1,14 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+env/
+venv/
+.venv/
+chroma_db/
+api_results_log.jsonl
+test_results.json
+README_assets/

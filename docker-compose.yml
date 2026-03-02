@@ -1,0 +1,33 @@
+services:
+  ccpa-api:
+    image: dev1234de/ccpa-compliance:latest
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PRELOAD_ARTIFACTS: ${PRELOAD_ARTIFACTS:-0}
+    container_name: ccpa-compliance-api
+    ports:
+      - "8000:8000"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      FORCE_REBUILD_DB: ${FORCE_REBUILD_DB:-0}
+    restart: unless-stopped
+    volumes:
+      - chroma_db:/app/chroma_db
+      - hf_cache:/app/.cache/huggingface
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import http.client,json,sys; c=http.client.HTTPConnection('127.0.0.1',8000,timeout=4); c.request('GET','/health'); r=c.getresponse(); d=json.loads(r.read().decode('utf-8')); sys.exit(0 if ((r.status==200 and d.get('status')=='ok') or (r.status==503 and d.get('status')=='loading')) else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15m
+
+volumes:
+  chroma_db:
+  hf_cache:

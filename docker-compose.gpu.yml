@@ -1,0 +1,3 @@
+services:
+  ccpa-api:
+    gpus: all
