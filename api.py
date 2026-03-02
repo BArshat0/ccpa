@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from pypdf import PdfReader
 from app import get_vector_db, get_llm, CCPAComplianceCheck
 from langchain_classic.chains.retrieval import create_retrieval_chain
 from langchain_classic.chains.combine_documents.stuff import create_stuff_documents_chain
@@ -18,18 +17,12 @@ from langchain_core.output_parsers import PydanticOutputParser
 retrieval_chain = None
 is_ready = False
 startup_error: str | None = None
-statute_section_corpus: dict[str, dict[str, object]] = {}
-prompt_refiner_llm = None
 
 SECTION_ID_PATTERN = re.compile(
     r"1798\.\d+(?:\.\d+)?(?:\([a-z0-9]+\))*",
     re.IGNORECASE
 )
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
-STATUTE_HEADING_PATTERN = re.compile(
-    r"(?m)^\s*(1798\.\d+(?:\.\d+)?(?:\([a-z0-9]+\))?)\.\s+(.*)$",
-    re.IGNORECASE
-)
 STOPWORDS = {
     "the", "and", "for", "with", "that", "this", "from", "into", "your", "you",
     "their", "they", "them", "our", "are", "was", "were", "have", "has", "had",
@@ -38,82 +31,6 @@ STOPWORDS = {
     "been", "than", "then", "too", "out", "use", "using", "over", "under", "after",
     "before", "between", "within", "through", "across", "such", "per"
 }
-
-LEGAL_GENERIC_TOKENS = {
-    "consumer", "consumers", "business", "businesses", "personal", "information",
-    "right", "rights", "request", "requests", "shall", "section", "title",
-    "collects", "collected", "collection", "processing", "data"
-}
-
-COMPLIANT_PATTERNS = [
-    "clear privacy policy",
-    "allows customers to opt out",
-    "allow customers to opt out",
-    "do not sell my personal information link",
-    "as required",
-    "deleted all personal data within 45 days",
-    "within 45 days",
-    "equal service and pricing",
-    "regardless of whether they exercise",
-    "honor all deletion requests",
-]
-
-VIOLATION_CUES = [
-    "without",
-    "not",
-    "no ",
-    "ignore",
-    "ignoring",
-    "refuse",
-    "refused",
-    "denied",
-    "higher price",
-    "different price",
-    "penal",
-    "fail",
-    "failed",
-]
-
-
-def _canonical_section(section_id: str) -> str:
-    return f"Section {section_id}"
-
-
-def _build_statute_section_corpus(pdf_path: str = "ccpa_statute.pdf") -> dict[str, dict[str, object]]:
-    if not os.path.exists(pdf_path):
-        return {}
-
-    reader = PdfReader(pdf_path)
-    # Skip cover/contents pages to avoid TOC contamination.
-    statute_text = "\n".join((page.extract_text() or "") for page in reader.pages[2:])
-    statute_text = statute_text.replace("\r", "\n")
-
-    matches = list(STATUTE_HEADING_PATTERN.finditer(statute_text))
-    if not matches:
-        return {}
-
-    corpus: dict[str, dict[str, object]] = {}
-    for idx, match in enumerate(matches):
-        section_id = match.group(1).lower()
-        title = " ".join(match.group(2).split())
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(statute_text)
-        body = " ".join(statute_text[start:end].split())
-
-        # Keep first full-body occurrence only.
-        if section_id in corpus:
-            continue
-
-        body_tokens = _tokenize(body)
-        title_tokens = _tokenize(title)
-        corpus[section_id] = {
-            "title": title,
-            "body": body,
-            "title_tokens": title_tokens,
-            "body_tokens": body_tokens,
-        }
-
-    return corpus
 
 
 def _normalize_section(raw_text: str) -> str | None:
@@ -157,7 +74,7 @@ def _score_chunk_relevance(prompt_tokens: set[str], chunk_text: str) -> int:
     return len(prompt_tokens.intersection(chunk_tokens))
 
 
-def _collect_grounded_section_scores(context_docs, prompt: str, max_sections: int = 6) -> dict[str, int]:
+def _collect_grounded_sections(context_docs, prompt: str, max_sections: int = 5) -> list[str]:
     prompt_tokens = _tokenize(prompt)
     section_scores: dict[str, int] = {}
     first_seen: dict[str, int] = {}
@@ -185,177 +102,36 @@ def _collect_grounded_section_scores(context_docs, prompt: str, max_sections: in
         section_scores.items(),
         key=lambda item: (-item[1], first_seen[item[0]])
     )
-    return {section: score for section, score in ranked[:max_sections]}
+    return [section for section, _ in ranked[:max_sections]]
 
 
-def _statute_phrase_boosts(prompt_lc: str, section_id: str) -> int:
-    boost = 0
-
-    # 1798.100 - collection notice and disclosure duties
-    if section_id == "1798.100":
-        if any(p in prompt_lc for p in ["collect", "collection", "privacy policy", "notice at collection"]):
-            boost += 4
-        if any(p in prompt_lc for p in ["without informing", "without notifying", "doesn't mention", "not mention"]):
-            boost += 3
-
-    # 1798.105 - deletion
-    if section_id == "1798.105":
-        if any(p in prompt_lc for p in ["delete", "deletion", "erase", "remove data"]):
-            boost += 5
-        if any(p in prompt_lc for p in ["ignore request", "refuse", "denied request", "keeping all records"]):
-            boost += 3
-
-    # 1798.106 - correction
-    if section_id == "1798.106":
-        if any(p in prompt_lc for p in ["correct inaccurate", "correction request", "inaccurate personal information"]):
-            boost += 5
-
-    # 1798.110 - right to know/access collected PI
-    if section_id == "1798.110":
-        if any(p in prompt_lc for p in ["right to know", "access request", "what personal information", "categories collected"]):
-            boost += 5
-
-    # 1798.115 - right to know sold/shared PI and recipients
-    if section_id == "1798.115":
-        if any(p in prompt_lc for p in ["shared with", "sold to", "third party recipients", "to whom"]):
-            boost += 4
-
-    # 1798.120 - opt-out of sale/sharing; minors consent for sale/sharing
-    if section_id == "1798.120":
-        if any(p in prompt_lc for p in ["sell", "selling", "data broker", "opt out", "do not sell", "share personal information"]):
-            boost += 6
-        if any(p in prompt_lc for p in ["minor", "under 16", "13-year", "14-year", "without consent", "parent consent"]):
-            boost += 4
-
-    # 1798.121 - sensitive PI limitation
-    if section_id == "1798.121":
-        if any(p in prompt_lc for p in ["sensitive personal information", "limit use", "limit disclosure"]):
-            boost += 5
-
-    # 1798.125 - non-discrimination / retaliation
-    if section_id == "1798.125":
-        if any(p in prompt_lc for p in ["discriminat", "higher price", "different price", "deny service", "retaliat"]):
-            boost += 6
-
-    # 1798.130 / 1798.135 - request-handling and links/notice methods
-    if section_id == "1798.130":
-        if any(p in prompt_lc for p in ["request method", "toll-free", "response timeline", "verifiable consumer request"]):
-            boost += 4
-    if section_id == "1798.135":
-        if any(p in prompt_lc for p in ["do not sell or share", "limit the use of my sensitive", "homepage link"]):
-            boost += 5
-
-    # 1798.150 - security breach private right of action
-    if section_id == "1798.150":
-        if any(p in prompt_lc for p in ["data breach", "security breach", "unauthorized access", "exfiltration", "stolen"]):
-            boost += 5
-
-    return boost
-
-
-def _section_allowed_by_prompt(section: str, prompt_lc: str) -> bool:
-    if section == "Section 1798.125":
-        return any(k in prompt_lc for k in ["discriminat", "higher price", "different price", "deny service", "retaliat", "penal"])
-    if section == "Section 1798.105":
-        return any(k in prompt_lc for k in ["delete", "deletion", "erase", "remove data"])
-    if section == "Section 1798.120":
-        return any(k in prompt_lc for k in ["sell", "selling", "data broker", "opt out", "do not sell", "share personal information", "minor", "under 16"])
-    if section == "Section 1798.100":
-        return any(k in prompt_lc for k in ["collect", "collecting", "privacy policy", "notice", "without informing", "without notifying", "does not mention", "doesn't mention"])
-    if section == "Section 1798.121":
-        return any(k in prompt_lc for k in ["sensitive personal information", "limit use", "limit disclosure"])
-    if section == "Section 1798.150":
-        return any(k in prompt_lc for k in ["data breach", "security breach", "unauthorized access", "exfiltration", "stolen"])
-    return True
-
-
-def _rule_based_decision(prompt: str) -> tuple[bool | None, list[str]]:
+def _infer_sections_from_prompt(prompt: str) -> list[str]:
     prompt_lc = (prompt or "").lower()
-    sections: list[str] = []
+    inferred = []
 
-    def add(section_id: str):
-        section = _canonical_section(section_id)
-        if section not in sections:
-            sections.append(section)
+    if (
+        "delete" in prompt_lc
+        and any(term in prompt_lc for term in ["request", "consumer", "customer"])
+    ):
+        inferred.append("Section 1798.105")
+    if any(term in prompt_lc for term in ["sell", "selling", "data broker", "opt out", "do not sell"]):
+        inferred.append("Section 1798.120")
+    if any(term in prompt_lc for term in ["collect", "collection", "privacy policy", "notice"]):
+        inferred.append("Section 1798.100")
+    if any(term in prompt_lc for term in ["discriminat", "higher price", "different price", "penalty"]):
+        inferred.append("Section 1798.125")
 
-    # Explicitly compliant phrasing from common CCPA-compliant scenarios.
-    if any(p in prompt_lc for p in COMPLIANT_PATTERNS):
-        return False, []
-
-    has_violation_cue = any(cue in prompt_lc for cue in VIOLATION_CUES)
-
-    # 1798.105 deletion request ignored/denied
-    if "delete" in prompt_lc and any(k in prompt_lc for k in ["request", "consumer", "customer"]):
-        if any(k in prompt_lc for k in ["ignore", "ignoring", "refuse", "refused", "denied", "keeping all records"]):
-            add("1798.105")
-
-    # 1798.120 sale/share without opt-out or without required consent
-    if any(k in prompt_lc for k in ["sell", "selling", "data broker", "share personal information", "sharing personal information"]):
-        if any(k in prompt_lc for k in ["without", "no chance to opt out", "without opt out", "no opt out", "without consent"]):
-            add("1798.120")
-        if any(k in prompt_lc for k in ["minor", "under 16", "13-year", "14-year", "parent"]):
-            add("1798.120")
-
-    # 1798.100 notice at collection / disclosure duties
-    if any(k in prompt_lc for k in ["collect", "collecting", "privacy policy", "notice"]):
-        if any(k in prompt_lc for k in ["doesn't mention", "not mention", "without informing", "without notifying", "does not mention"]):
-            add("1798.100")
-
-    # 1798.125 discriminatory treatment for rights exercise
-    if any(k in prompt_lc for k in ["higher price", "different price", "discriminat", "deny service", "penal"]):
-        if any(k in prompt_lc for k in ["opt out", "privacy rights", "exercise rights", "do not sell"]):
-            add("1798.125")
-
-    # 1798.135 missing required do-not-sell/limit-use mechanisms
-    if "do not sell" in prompt_lc and any(k in prompt_lc for k in ["missing", "no link", "not available", "cannot find"]):
-        add("1798.135")
-
-    # 1798.150 breach/security harm
-    if any(k in prompt_lc for k in ["data breach", "security breach", "unauthorized access", "stolen personal information", "exfiltration"]):
-        add("1798.150")
-
-    if sections:
-        return True, sections
-
-    # When no specific section is confidently mapped, avoid overriding the model.
-    if has_violation_cue:
-        return None, []
-    return None, []
+    # Preserve order and deduplicate
+    seen = set()
+    unique = []
+    for section in inferred:
+        if section not in seen:
+            seen.add(section)
+            unique.append(section)
+    return unique
 
 
-def _score_sections_from_statute(prompt: str, max_sections: int = 6) -> dict[str, int]:
-    if not statute_section_corpus:
-        return {}
-
-    prompt_lc = (prompt or "").lower()
-    prompt_tokens = _tokenize(prompt)
-    prompt_specific = {t for t in prompt_tokens if t not in LEGAL_GENERIC_TOKENS}
-    scores: dict[str, int] = {}
-
-    for section_id, meta in statute_section_corpus.items():
-        title_tokens = {t for t in meta["title_tokens"] if t not in LEGAL_GENERIC_TOKENS}
-        body_tokens = {t for t in meta["body_tokens"] if t not in LEGAL_GENERIC_TOKENS}
-
-        # Emphasize heading semantics first, then body overlap.
-        overlap_title = len(prompt_specific.intersection(title_tokens))
-        overlap_body = min(2, len(prompt_specific.intersection(body_tokens)))
-        score = (overlap_title * 5) + overlap_body + _statute_phrase_boosts(prompt_lc, section_id)
-        section = _canonical_section(section_id)
-        if not _section_allowed_by_prompt(section, prompt_lc):
-            score -= 5
-        if score > 0:
-            scores[section] = score
-
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    return {section: score for section, score in ranked[:max_sections]}
-
-
-def _resolve_articles(
-    prompt: str,
-    model_articles: list[str],
-    grounded_scores: dict[str, int],
-    rule_sections: list[str] | None = None,
-) -> list[str]:
+def _resolve_articles(prompt: str, model_articles: list[str], grounded_sections: list[str]) -> list[str]:
     normalized_model = []
     seen_model = set()
     for item in model_articles or []:
@@ -368,86 +144,26 @@ def _resolve_articles(
             seen_model.add(normalized_single)
             normalized_model.append(normalized_single)
 
-    statute_scores = _score_sections_from_statute(prompt)
-    prompt_lc = (prompt or "").lower()
-    grounded_set = set(grounded_scores.keys())
-    rule_set = set(rule_sections or [])
-    candidates = set(normalized_model) | set(statute_scores.keys()) | grounded_set | rule_set
+    grounded_set = set(grounded_sections)
+    if grounded_sections:
+        trusted_model = [s for s in normalized_model if s in grounded_set]
+        if trusted_model:
+            return trusted_model
 
-    ranked_scores: dict[str, int] = {}
-    for section in candidates:
-        score = 0
-        if section in rule_set:
-            score += 10
-        score += grounded_scores.get(section, 0) * 5
-        score += statute_scores.get(section, 0) * 2
-        if section in normalized_model:
-            score += 2
-        if section in grounded_set and section in normalized_model:
-            score += 2
-        if not _section_allowed_by_prompt(section, prompt_lc):
-            score -= 8
-        # Keep only citations that exist in the parsed statute corpus when available.
-        if statute_section_corpus:
-            sec_id = section.replace("Section ", "").lower()
-            if sec_id not in statute_section_corpus:
-                score = 0
-        ranked_scores[section] = score
+        inferred = _infer_sections_from_prompt(prompt)
+        trusted_inferred = [s for s in inferred if s in grounded_set]
+        if trusted_inferred:
+            return trusted_inferred
 
-    ranked = sorted(
-        [(s, sc) for s, sc in ranked_scores.items() if sc > 0],
-        key=lambda item: item[1],
-        reverse=True
-    )
+        return grounded_sections[:3]
 
-    # Prioritize sections that are explicitly retrieved from context.
-    grounded_ranked = [section for section, _ in ranked if section in grounded_set]
-    if grounded_ranked:
-        return grounded_ranked[:3]
+    if normalized_model:
+        return normalized_model[:3]
 
-    if ranked:
-        return [section for section, _ in ranked[:3]]
-
-    return normalized_model[:3]
-
-
-def _refine_prompt_with_llm(original_prompt: str) -> str:
-    if not original_prompt or not prompt_refiner_llm:
-        return original_prompt
-
-    refinement_prompt = f"""<|im_start|>system
-You rewrite compliance prompts for legal analysis quality.
-Rules:
-1) Preserve original meaning and facts exactly.
-2) Do not add or invent new facts.
-3) Make the scenario explicit about action, actor, and potential policy/legal issue.
-4) Output one plain sentence only.
-<|im_end|>
-<|im_start|>user
-Original prompt: {original_prompt}
-<|im_end|>
-<|im_start|>assistant
-"""
-
-    try:
-        refined = prompt_refiner_llm.invoke(refinement_prompt)
-        refined = str(refined).strip()
-        refined = re.sub(r"^(refined prompt|rewritten prompt)\s*:\s*", "", refined, flags=re.IGNORECASE)
-        refined = re.sub(r"\s+", " ", refined).strip().strip("\"'")
-
-        if not refined:
-            return original_prompt
-        # Guardrail: if refinement looks malformed, keep original.
-        if len(refined) < 12:
-            return original_prompt
-        return refined[:1200]
-    except Exception as e:
-        print(f"Prompt refinement failed, using original prompt. Error: {e}")
-        return original_prompt
-
+    return _infer_sections_from_prompt(prompt)[:3]
 
 def _initialize_models():
-    global retrieval_chain, is_ready, startup_error, statute_section_corpus, prompt_refiner_llm
+    global retrieval_chain, is_ready, startup_error
     print("Starting up and loading models... This might take a few minutes.")
 
     try:
@@ -457,7 +173,6 @@ def _initialize_models():
         
         # Load the LLM (Qwen2.5-1.5B)
         llm = get_llm()
-        prompt_refiner_llm = llm
         
         # Initialize parser explicitly to ensure json formatting
         parser = PydanticOutputParser(pydantic_object=CCPAComplianceCheck)
@@ -485,10 +200,6 @@ Question/Scenario: {input}<|im_end|>
         
         combine_docs_chain = create_stuff_documents_chain(llm, prompt)
         retrieval_chain = create_retrieval_chain(retriever, combine_docs_chain)
-
-        # Build searchable section corpus from the full statute for citation ranking.
-        statute_section_corpus = _build_statute_section_corpus()
-        print(f"Loaded statute section corpus with {len(statute_section_corpus)} sections.")
         
         # Mark health check as ready
         is_ready = True
@@ -546,13 +257,9 @@ async def analyze_prompt(request: AnalyzeRequest):
     
     # 1. Invoke the LangChain retrieval chain
     try:
-        refined_prompt = _refine_prompt_with_llm(request.prompt)
-        if refined_prompt != request.prompt:
-            print(f"Refined prompt: '{refined_prompt}'")
-
-        response = retrieval_chain.invoke({"input": refined_prompt})
+        response = retrieval_chain.invoke({"input": request.prompt})
         raw_answer = response.get("answer", "").strip()
-        grounded_scores = _collect_grounded_section_scores(response.get("context", []), refined_prompt)
+        grounded_sections = _collect_grounded_sections(response.get("context", []), request.prompt)
         
         # 2. Parse into Pydantic model
         try:
@@ -571,18 +278,11 @@ async def analyze_prompt(request: AnalyzeRequest):
                 raise Exception("No JSON object found in output.")
         
         # 3. Logic validation
-        rule_harmful, rule_sections = _rule_based_decision(request.prompt)
-
-        if rule_harmful is False:
-            parsed_output.harmful = False
-            parsed_output.articles = []
-        elif parsed_output.harmful or rule_harmful is True:
-            parsed_output.harmful = True
+        if parsed_output.harmful:
             parsed_output.articles = _resolve_articles(
                 prompt=request.prompt,
                 model_articles=parsed_output.articles,
-                grounded_scores=grounded_scores,
-                rule_sections=rule_sections
+                grounded_sections=grounded_sections
             )
         else:
             # If harmful is false, articles must be empty

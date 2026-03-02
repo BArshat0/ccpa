@@ -52,7 +52,7 @@ def get_vector_db():
         documents = loader.load()
         
         # Larger chunks preserve section headers with surrounding obligations for better citation grounding.
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=120)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
         docs = text_splitter.split_documents(documents)
         
         vector_db = Chroma.from_documents(
@@ -100,10 +100,55 @@ def get_llm():
     # Return as LangChain component
     return HuggingFacePipeline(pipeline=pipe)
 
+def refine_user_query(raw_query: str, llm) -> str:
+    """
+    Refine user queries to match CCPA statute language structure from the PDF.
+    This helps the embedding model find the most relevant statute sections.
+    
+    Flow: User Query → Refined Query (statute language) → Embedding Model finds matching sections
+    """
+    refinement_prompt = PromptTemplate(
+        template="""<|im_start|>system
+You are an expert at translating plain language queries into CCPA statute language and terminology.
+
+Your goal: Transform the user's plain language input into a query that matches the exact language, phrasing, and structure used in the CCPA statute PDF. This makes the embedding model find the most relevant statute sections.
+
+Use these guidelines:
+1. Match the statute's formal terminology exactly (e.g., "personal information", "consumer", "business", "sale", "service provider", "contractor")
+2. Use the statute's syntax and phrasing patterns (e.g., "A consumer may request...", "A business shall...", "The right to...")
+3. Include key statute concepts (notice, disclosure, opt-out, right to know, right to delete, right to correct, sale of personal information)
+4. Remove casual language and convert to legal/formal statute language
+5. Make it searchable for statute chunks - think about what words/phrases appear in the PDF sections
+
+Examples showing the transformation:
+- "Can I sell user data?" → "Sale of personal information from consumers"
+- "Do I need permission?" → "Consumer consent for collection and use of personal information"
+- "What should I tell customers?" → "Notice to consumers regarding collection and use of personal information"
+- "Can I share data with partners?" → "Disclosure of consumer personal information to service providers and contractors"
+
+Return ONLY the refined query in statute language format. No explanations, no suggestions, no markdown.<|im_end|>
+<|im_start|>user
+User question: {query}<|im_end|>
+<|im_start|>assistant
+""",
+        input_variables=["query"]
+    )
+    
+    chain = refinement_prompt | llm
+    refined_query = chain.invoke({"query": raw_query})
+    
+    # Extract the refined query text
+    if isinstance(refined_query, str):
+        refined_query_text = refined_query.strip()
+    else:
+        refined_query_text = str(refined_query).strip()
+    
+    return refined_query_text
+
 def main():
     # 1. Initialize DB and Retriever
     vector_db = get_vector_db()
-    retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+    retriever = vector_db.as_retriever(search_kwargs={"k": 10})
     
     # 2. Initialize LLM Pipeline
     llm = get_llm()
@@ -142,8 +187,12 @@ Question/Scenario: {input}<|im_end|>
             if query.lower() in ['quit', 'exit', 'q']:
                 break
                 
-            print("Thinking...")
-            response = retrieval_chain.invoke({"input": query})
+            print("Refining your query...")
+            refined_query = refine_user_query(query, llm)
+            print(f"Refined Query: {refined_query}")
+            
+            print("Retrieving relevant sections and analyzing...")
+            response = retrieval_chain.invoke({"input": refined_query})
             
             raw_answer = response.get("answer", "").strip()
             print("\nRaw Answer:")
