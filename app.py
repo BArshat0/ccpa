@@ -67,14 +67,11 @@ def get_vector_db():
 def get_llm():
     print(f"Downloading/Loading LLM: {MODEL_ID}...")
     
-    # Check if GPU is available to use 4-bit quantization with bitsandbytes
+    # Check if GPU is available to use 8-bit quantization with bitsandbytes
     if torch.cuda.is_available():
-        print("GPU detected. Using 4-bit quantization (bitsandbytes)...")
+        print("GPU detected. Using 8-bit quantization (bitsandbytes)...")
         quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
+            load_in_8bit=True,
         )
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
